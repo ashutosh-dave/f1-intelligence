@@ -68,4 +68,4 @@ cd frontend && npm install && npm run dev
 
 ## License
 
-MIT
+GNU General Public License v3.0
