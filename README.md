@@ -56,11 +56,6 @@ cd frontend && npm install && npm run dev
 | Frontend | React, Vite, Recharts |
 | Infra | Docker, Docker Compose |
 
-## Data Sources
-
-- [Ergast Developer API](http://ergast.com/mrd/) — Historical F1 race data (2010–2024)
-- Synthetic weather generation (extensible to real weather APIs)
-
 ## License
 
 GNU General Public License v3.0
