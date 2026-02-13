@@ -21,56 +21,67 @@ from data.models import (
     Qualifying, Race, RaceResult, Weather,
 )
 from simulator.config import SimulationConfig
-from simulator.engine import DriverSetup, RaceSimulator
+from simulator.schemas import (
+    DriverInput, MLPriors, RaceInput, TrackProfile, WeatherConditions,
+)
+from simulator.engine import RaceSimulator
 
 router = APIRouter()
 
 
-def _build_driver_setups(
+def _build_driver_inputs(
     db: Session,
     race: Race,
     results: list[RaceResult],
-) -> list[DriverSetup]:
-    """Build DriverSetup objects from race results and qualifying data."""
-    setups = []
-    base_pace = 90.0  # base lap time in seconds (normalized)
+    ml_preds: dict[int, dict] | None = None,
+) -> list[DriverInput]:
+    """Build DriverInput objects from race results, qualifying, and ML predictions."""
+    inputs = []
 
     for res in results:
         driver = db.query(Driver).get(res.driver_id)
-        constructor = db.query(Constructor).get(res.constructor_id)
+        constructor = db.query(Constructor).get(res.constructor_id) if res.constructor_id else None
 
-        # Estimate pace from grid position (rough correlation)
-        pace_offset = (res.grid - 1) * 0.12  # ~0.12s per grid slot
-
-        # Get qualifying delta for more precise pace
+        # Qualifying data for pace
         quali = (
             db.query(Qualifying)
             .filter_by(race_id=race.id, driver_id=res.driver_id)
             .first()
         )
-        if quali:
-            # Use qualifying data for pace if available
-            pace_offset = (quali.position - 1) * 0.1
+        grid = quali.position if quali else res.grid
 
-        # Get DNF probability from features if available
+        # DNF rate from features
         feature = (
             db.query(FeatureRow)
             .filter_by(race_id=race.id, driver_id=res.driver_id)
             .first()
         )
-        dnf_prob = feature.driver_dnf_rate if feature and feature.driver_dnf_rate else 0.05
+        dnf_rate = feature.driver_dnf_rate if feature and feature.driver_dnf_rate else 0.05
 
         name = f"{driver.first_name} {driver.last_name}" if driver else f"Driver {res.driver_id}"
 
-        setups.append(DriverSetup(
+        # ML priors (if available)
+        ml_prior = None
+        if ml_preds and res.driver_id in ml_preds:
+            mp = ml_preds[res.driver_id]
+            ml_prior = MLPriors(
+                win_probability=mp.get("win_prob", 0.0),
+                podium_probability=mp.get("podium_prob", 0.0),
+                dnf_probability=mp.get("dnf_prob", 0.05),
+                predicted_position=mp.get("expected_position", 10.0),
+            )
+
+        inputs.append(DriverInput(
             driver_id=res.driver_id,
             name=name,
-            grid_position=res.grid,
-            base_pace=base_pace + pace_offset,
-            dnf_probability=dnf_prob,
+            driver_code=driver.code if driver else "",
+            constructor=constructor.name if constructor else "",
+            grid_position=grid,
+            team_reliability=1.0 - dnf_rate,
+            ml_priors=ml_prior,
         ))
 
-    return setups
+    return inputs
 
 
 @router.post("/predict", response_model=PredictResponse)
@@ -79,7 +90,8 @@ async def predict(request: PredictRequest, db: Session = Depends(get_db)):
     Generate race outcome predictions.
 
     Combines ML model predictions with Monte Carlo simulation results
-    using the ensemble combiner.
+    using the ensemble combiner.  ML predictions are passed into the
+    simulator as priors via the DriverInput schema.
     """
     # Look up the race
     race = (
@@ -94,16 +106,15 @@ async def predict(request: PredictRequest, db: Session = Depends(get_db)):
         )
 
     circuit = db.query(Circuit).get(race.circuit_id)
-    weather = db.query(Weather).filter_by(race_id=race.id).first()
+    weather_row = db.query(Weather).filter_by(race_id=race.id).first()
 
-    # Get race results (we need the grid for simulation)
     results = db.query(RaceResult).filter_by(race_id=race.id).all()
     if not results:
         raise HTTPException(status_code=404, detail="No results found for this race")
 
     # ── ML Predictions ──
+    ml_preds: dict[int, dict] = {}
     features = db.query(FeatureRow).filter_by(race_id=race.id).all()
-    ml_preds = {}
     if features:
         try:
             import pandas as pd
@@ -128,18 +139,32 @@ async def predict(request: PredictRequest, db: Session = Depends(get_db)):
                     "expected_position": float(row["expected_position"]),
                 }
         except Exception:
-            # ML models not trained yet — continue with simulation only
             pass
 
-    # ── Monte Carlo Simulation ──
-    driver_setups = _build_driver_setups(db, race, results)
-    rain_prob = weather.rain_probability if weather else 0.0
+    # ── Build structured input with ML priors ──
+    driver_inputs = _build_driver_inputs(db, race, results, ml_preds)
 
-    config = SimulationConfig(
-        n_simulations=2000,  # fewer for API responsiveness
+    rain_prob = weather_row.rain_probability if weather_row else 0.0
+    track = TrackProfile(
+        name=circuit.name if circuit else "Unknown",
         total_laps=race.total_laps or 55,
     )
-    simulator = RaceSimulator(driver_setups, config, rain_probability=rain_prob)
+    weather_cond = WeatherConditions(
+        rain_probability=rain_prob,
+        conditions="wet" if rain_prob > 0.5 else "dry",
+    )
+    race_input = RaceInput(
+        drivers=driver_inputs,
+        track=track,
+        weather=weather_cond,
+        season_year=request.season_year,
+        round_number=request.round_number,
+        race_name=race.name,
+    )
+
+    # ── Monte Carlo Simulation ──
+    config = SimulationConfig(n_simulations=2000)
+    simulator = RaceSimulator.from_race_input(race_input, config)
     sim_results = simulator.run().to_dict()
 
     # ── Ensemble ──

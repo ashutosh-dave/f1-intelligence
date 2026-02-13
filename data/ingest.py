@@ -1,12 +1,17 @@
 """
 Data ingestion pipeline for the F1 Race Intelligence Engine.
 
-Fetches historical F1 data from the Ergast API (http://ergast.com/mrd/)
-for seasons 2010–2024 and persists it into the database.
+Fetches historical F1 data from the Jolpica-F1 API (Ergast-compatible)
+for seasons 2010–present and persists it into the database.
+
+Data sources:
+  - Jolpica-F1:  https://api.jolpi.ca/ergast/f1  (historical + current, Ergast drop-in)
+  - OpenF1:      https://api.openf1.org           (real-time telemetry, no signup)
+  - Hyprace:     https://developers.hyprace.com   (live data, low latency)
 
 Usage:
-    python -m data.ingest           # Ingest all seasons 2010–2024
-    python -m data.ingest --year 2023  # Ingest a single season
+    python -m data.ingest              # Ingest all seasons 2010–2025
+    python -m data.ingest --year 2024  # Ingest a single season
 """
 
 from __future__ import annotations
@@ -31,9 +36,15 @@ from data.models import (
 
 # ─── Constants ─────────────────────────────────────────────────────────────────
 
-ERGAST_BASE = "http://ergast.com/api/f1"
+# Primary data source: Jolpica-F1 (Ergast-compatible drop-in replacement)
+# The original Ergast API (ergast.com) is defunct and the domain is for sale.
+JOLPICA_BASE = "https://api.jolpi.ca/ergast/f1"
+
+# Legacy alias — kept so downstream references still resolve
+ERGAST_BASE = JOLPICA_BASE
+
 START_YEAR = 2010
-END_YEAR = 2024
+END_YEAR = 2025
 REQUEST_DELAY = 0.5  # polite rate limiting (seconds)
 
 REGULATION_ERAS = {
@@ -66,7 +77,7 @@ KNOWN_WET_RACES = {
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
 def _get(url: str, params: dict[str, Any] | None = None) -> dict:
-    """Make a GET request to the Ergast API with retries."""
+    """Make a GET request to the Jolpica-F1 / Ergast-compatible API with retries."""
     params = params or {}
     params["limit"] = 1000
     for attempt in range(3):

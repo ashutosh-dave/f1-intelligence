@@ -58,7 +58,12 @@ cd frontend && npm install && npm run dev
 
 ## Data Sources
 
-- [Ergast Developer API](http://ergast.com/mrd/) — Historical F1 race data (2010–2024)
+| API | Role | Base URL |
+|-----|------|----------|
+| [Jolpica-F1](https://api.jolpi.ca/ergast/f1) | Historical + current (Ergast drop-in) | `api.jolpi.ca/ergast/f1` |
+| [OpenF1](https://api.openf1.org) | Real-time telemetry, no signup | `api.openf1.org` |
+| [Hyprace](https://developers.hyprace.com) | Live data, low latency | `developers.hyprace.com` |
+
 - Synthetic weather generation (extensible to real weather APIs)
 
 ## License

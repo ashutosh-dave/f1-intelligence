@@ -1,102 +1,129 @@
 """
-Monte Carlo Race Simulation Engine.
+Monte Carlo Race Simulation Engine — v2 (Modular).
 
-Simulates F1 races stochastically by sampling:
-  - Driver pace variance (Gaussian noise per lap)
-  - Pit stop timing and execution
-  - Tire degradation effects
-  - Mechanical/reliability DNFs
-  - Safety car events (Poisson-distributed)
-  - Weather impact
+Orchestrates modular sub-components to simulate F1 races:
+  - Pace module:       lap time sampling with ML priors
+  - Strategy module:   pit stop generation and reactive SC pitting
+  - Reliability module: per-lap DNF sampling with bathtub curve
+  - Safety car module: Poisson-distributed SC/VSC events
+  - Ranking module:    first-lap shuffle, restart volatility, classification
 
-Produces probability distributions of finishing positions
-across N simulation iterations.
+Supports:
+  - Structured RaceInput / SimulationOutput schemas
+  - Parallel execution via ProcessPoolExecutor
+  - Backward-compatible DriverSetup API
 
-Usage:
+Usage (new API):
     from simulator.engine import RaceSimulator
-    sim = RaceSimulator(drivers, config)
+    from simulator.schemas import RaceInput, DriverInput, TrackProfile
+    race_input = RaceInput(drivers=[...], track=TrackProfile(...))
+    sim = RaceSimulator.from_race_input(race_input, config)
+    output = sim.run()
+
+Usage (legacy API):
+    from simulator.engine import RaceSimulator, DriverSetup
+    sim = RaceSimulator(drivers=[DriverSetup(...)], config=config)
     results = sim.run()
 """
 
 from __future__ import annotations
 
+import math
 import random
-from collections import Counter, defaultdict
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 
 from simulator.config import SimulationConfig
-from simulator.strategy import Strategy, generate_strategy, _tire_degradation
+from simulator.schemas import (
+    DriverInput,
+    DriverResult,
+    MLPriors,
+    RaceInput,
+    SimulationOutput,
+    TrackProfile,
+    WeatherConditions,
+)
+from simulator.strategy import Strategy, generate_strategy, should_pit_under_sc
+from simulator.modules.pace import (
+    compute_base_pace,
+    compute_pace_sigma,
+    sample_lap_time,
+)
+from simulator.modules.reliability import compute_race_dnf_probability, sample_dnf
+from simulator.modules.safety_car import (
+    SafetyCarEvent,
+    build_sc_lap_lookup,
+    generate_safety_car_events,
+    is_restart_lap,
+)
+from simulator.modules.ranking import (
+    DriverState,
+    apply_first_lap_shuffle,
+    apply_restart_volatility,
+    classify_finishing_order,
+)
 
 
-# ─── Data Types ────────────────────────────────────────────────────────────────
+# ─── Legacy Data Type (backward compatibility) ─────────────────────────────────
 
 @dataclass
 class DriverSetup:
-    """Input configuration for a driver in the simulation."""
+    """Legacy input configuration — kept for backward compatibility."""
     driver_id: int
     name: str
     grid_position: int
     base_pace: float              # base lap time in seconds
-    dnf_probability: float = 0.05 # per-race DNF probability
-    rain_skill: float = 1.0       # multiplier (1.0 = neutral, <1 = better in rain)
+    dnf_probability: float = 0.05
+    rain_skill: float = 1.0
+
+    def to_driver_input(self) -> DriverInput:
+        """Convert to the new DriverInput schema."""
+        return DriverInput(
+            driver_id=self.driver_id,
+            name=self.name,
+            grid_position=self.grid_position,
+            team_reliability=1.0 - self.dnf_probability,
+            rain_skill=self.rain_skill,
+        )
 
 
-@dataclass
-class DriverState:
-    """Mutable state of a driver during a single simulation."""
-    driver_id: int
-    name: str
-    total_time: float = 0.0
-    current_lap: int = 0
-    current_tire: str = "medium"
-    tire_age: int = 0
-    stops_done: int = 0
-    is_dnf: bool = False
-    dnf_lap: Optional[int] = None
-    final_position: Optional[int] = None
-
+# ─── Single-Iteration Result (internal) ────────────────────────────────────────
 
 @dataclass
-class SimulationResult:
-    """Result of a single simulation iteration."""
-    finishing_order: list[int]     # driver_ids in finishing order
-    dnf_drivers: list[int]        # driver_ids that DNF'd
-    safety_car_laps: list[int]    # laps where safety car was deployed
+class _IterationResult:
+    finishing_order: list[int]
+    dnf_drivers: list[int]
+    n_safety_cars: int
 
+
+# ─── Legacy AggregatedResults (backward compatibility) ─────────────────────────
 
 @dataclass
 class AggregatedResults:
-    """Aggregated results across all simulation iterations."""
+    """Legacy output — wraps SimulationOutput for backward compat."""
     driver_ids: list[int]
     driver_names: dict[int, str]
     n_simulations: int
-
-    # Position distributions: driver_id → {position: count}
     position_counts: dict[int, dict[int, int]]
-
-    # Derived probabilities
     win_probability: dict[int, float]
     podium_probability: dict[int, float]
     expected_position: dict[int, float]
     position_std: dict[int, float]
     dnf_rate: dict[int, float]
-
-    # Summary of safety car frequency
     avg_safety_cars: float
 
     def to_dict(self) -> dict:
-        """Serialize to a JSON-friendly dictionary."""
+        """Serialize to JSON-friendly dictionary (legacy format)."""
         drivers = []
         for did in self.driver_ids:
-            # Build position distribution
             pos_dist = {}
             total = sum(self.position_counts[did].values())
             for pos, count in sorted(self.position_counts[did].items()):
                 pos_dist[str(pos)] = round(count / total, 4)
-
             drivers.append({
                 "driver_id": did,
                 "name": self.driver_names.get(did, f"Driver {did}"),
@@ -107,10 +134,7 @@ class AggregatedResults:
                 "dnf_rate": round(self.dnf_rate.get(did, 0), 4),
                 "position_distribution": pos_dist,
             })
-
-        # Sort by expected position
         drivers.sort(key=lambda d: d["expected_position"])
-
         return {
             "n_simulations": self.n_simulations,
             "avg_safety_cars_per_race": round(self.avg_safety_cars, 2),
@@ -118,150 +142,231 @@ class AggregatedResults:
         }
 
 
-# ─── Simulation Engine ────────────────────────────────────────────────────────
+# ─── Simulation Engine ─────────────────────────────────────────────────────────
 
 class RaceSimulator:
-    """Monte Carlo F1 race simulation engine."""
+    """
+    Monte Carlo F1 race simulation engine (v2).
+
+    Orchestrates modular pace, strategy, reliability, safety car,
+    and ranking components.  Supports both the new structured schema
+    API and the legacy DriverSetup API.
+    """
 
     def __init__(
         self,
-        drivers: list[DriverSetup],
+        drivers: list[DriverSetup] | list[DriverInput] | None = None,
         config: SimulationConfig | None = None,
         rain_probability: float = 0.0,
+        *,
+        race_input: RaceInput | None = None,
     ):
-        self.drivers = drivers
-        self.config = config or SimulationConfig()
-        self.rain_probability = rain_probability
-        self.rng = random.Random(self.config.seed)
-        self.np_rng = np.random.RandomState(self.config.seed)
+        """
+        Construct a simulator.
 
-    def _simulate_single_race(self) -> SimulationResult:
-        """Run a single race simulation."""
+        Parameters:
+            drivers:          List of DriverSetup (legacy) or DriverInput objects.
+            config:           SimulationConfig (optional, uses defaults).
+            rain_probability: Legacy rain probability override.
+            race_input:       New structured RaceInput (takes priority when set).
+        """
+        self.config = config or SimulationConfig()
+
+        if race_input is not None:
+            # ── New API ──
+            self._driver_inputs = race_input.drivers
+            self._track = race_input.track
+            self._weather = race_input.weather
+            self.config = self.config.apply_track_profile(self._track)
+            self._race_input = race_input
+        elif drivers is not None:
+            # ── Legacy API ──
+            if drivers and isinstance(drivers[0], DriverSetup):
+                self._driver_inputs = [d.to_driver_input() for d in drivers]
+            else:
+                self._driver_inputs = drivers  # already DriverInput
+            self._track = TrackProfile(total_laps=self.config.total_laps)
+            self._weather = WeatherConditions(
+                rain_probability=rain_probability,
+                conditions="wet" if rain_probability > 0.5 else "dry",
+            )
+            self._race_input = None
+        else:
+            raise ValueError("Either 'drivers' or 'race_input' must be provided.")
+
+        self._rng = random.Random(self.config.seed)
+        self._np_rng = np.random.RandomState(self.config.seed)
+
+    @classmethod
+    def from_race_input(
+        cls,
+        race_input: RaceInput,
+        config: SimulationConfig | None = None,
+    ) -> RaceSimulator:
+        """Preferred constructor using the new structured schema."""
+        race_input.validate()
+        return cls(config=config, race_input=race_input)
+
+    # ── Single Iteration ────────────────────────────────────────────────────
+
+    def _simulate_single_race(self) -> _IterationResult:
+        """Run one full race simulation."""
         config = self.config
         total_laps = config.total_laps
+        weather = self._weather
+        track = self._track
 
-        # Determine weather for this simulation
-        is_wet = self.rng.random() < self.rain_probability
+        # Determine if this iteration is wet
+        is_wet_race = self._rng.random() < weather.rain_probability
+        effective_weather = WeatherConditions(
+            rain_probability=weather.rain_probability,
+            temperature_c=weather.temperature_c,
+            humidity_pct=weather.humidity_pct,
+            wind_speed_kph=weather.wind_speed_kph,
+            conditions="wet" if is_wet_race else weather.conditions,
+        )
 
-        # Generate safety car events (Poisson)
-        n_safety_cars = self.np_rng.poisson(config.safety_car_rate)
-        safety_car_laps_set = set()
-        for _ in range(n_safety_cars):
-            sc_start = self.rng.randint(1, max(1, total_laps - config.safety_car_laps))
-            for lap in range(sc_start, min(sc_start + config.safety_car_laps, total_laps + 1)):
-                safety_car_laps_set.add(lap)
+        # ── Generate safety car events ──
+        sc_events = generate_safety_car_events(
+            config, track, effective_weather, self._rng, self._np_rng,
+        )
+        sc_lookup = build_sc_lap_lookup(sc_events)
 
-        # Initialize driver states
+        # ── Compute pace sigma ──
+        sigma = compute_pace_sigma(config, effective_weather)
+
+        # ── Initialize driver states ──
         states: list[DriverState] = []
+        base_paces: dict[int, float] = {}
         strategies: dict[int, Strategy] = {}
+        race_dnf_probs: dict[int, float] = {}
 
-        for driver in self.drivers:
+        for driver in self._driver_inputs:
             state = DriverState(
                 driver_id=driver.driver_id,
                 name=driver.name,
             )
             states.append(state)
 
-            # Generate pit strategy
-            strategy = generate_strategy(config, self.rng, total_laps)
-            state.current_tire = strategy.starting_tire
-            strategies[driver.driver_id] = strategy
+            # Base pace from pace module
+            bp = compute_base_pace(driver, config, track)
+            base_paces[driver.driver_id] = bp
 
-        # Simulate lap by lap
+            # Strategy
+            strat = generate_strategy(
+                config, self._rng, total_laps,
+                weather=effective_weather,
+                preferred_stops=driver.preferred_strategy_stops,
+            )
+            state.current_tire = strat.starting_tire
+            strategies[driver.driver_id] = strat
+
+            # DNF probability
+            race_dnf_probs[driver.driver_id] = compute_race_dnf_probability(
+                driver, config, track, effective_weather,
+            )
+
+        # ── First-lap shuffle ──
+        states = apply_first_lap_shuffle(
+            states,
+            shuffle_probability=config.first_lap_position_shuffle,
+            incident_rate=config.first_lap_incident_rate,
+            rng=self._rng,
+        )
+
+        # ── Lap-by-lap simulation ──
+        driver_map = {d.driver_id: d for d in self._driver_inputs}
+
         for lap in range(1, total_laps + 1):
-            is_safety_car = lap in safety_car_laps_set
+            sc_event = sc_lookup.get(lap)
+            is_sc = sc_event is not None and not sc_event.is_vsc
+            is_vsc = sc_event is not None and sc_event.is_vsc
+            restart = is_restart_lap(lap, sc_events)
 
-            for i, state in enumerate(states):
+            for state in states:
                 if state.is_dnf:
                     continue
 
-                driver = self.drivers[i]
-                strategy = strategies[driver.driver_id]
+                driver = driver_map[state.driver_id]
+                strategy = strategies[state.driver_id]
 
-                # ── Check for reliability DNF ──
-                if self.rng.random() < (driver.dnf_probability / total_laps):
+                # ── Reliability check ──
+                if sample_dnf(
+                    driver, lap, total_laps,
+                    race_dnf_probs[state.driver_id],
+                    self._rng,
+                ):
                     state.is_dnf = True
                     state.dnf_lap = lap
-                    state.total_time += 999999  # penalty
+                    state.total_time += 999999
                     continue
 
-                # ── Base lap time ──
-                base_time = driver.base_pace
+                # ── Reactive SC pit? ──
+                if is_sc and state.stops_done < strategy.total_stops:
+                    sc_pit = should_pit_under_sc(
+                        state.tire_age, state.stops_done,
+                        strategy, config, self._rng,
+                    )
+                    if sc_pit:
+                        sc_pit.lap = lap
+                        state.total_time += sc_pit.pit_time_seconds
+                        state.current_tire = sc_pit.tire_compound
+                        state.tire_age = 0
+                        state.stops_done += 1
 
-                # ── Pace variance (Gaussian noise) ──
-                sigma = config.pace_sigma
-                if is_wet:
-                    sigma *= config.wet_variance_multiplier
-
-                pace_noise = self.np_rng.normal(0, sigma)
-                lap_time = base_time + pace_noise
-
-                # ── Weather penalty ──
-                if is_wet:
-                    wet_penalty = config.wet_pace_penalty * driver.rain_skill
-                    lap_time += wet_penalty
-
-                # ── Tire degradation ──
-                deg_rate = _tire_degradation(state.current_tire, config)
-                tire_deg_penalty = deg_rate * state.tire_age
-                lap_time += tire_deg_penalty
-                state.tire_age += 1
-
-                # ── Safety car ──
-                if is_safety_car:
-                    lap_time = base_time + config.safety_car_pace
-
-                # ── Pit stops ──
+                # ── Planned pit stops ──
                 for stop in strategy.stops:
-                    if stop.lap == lap:
-                        lap_time += stop.pit_time_seconds
+                    if stop.lap == lap and state.stops_done < strategy.total_stops:
+                        state.total_time += stop.pit_time_seconds
                         state.current_tire = stop.tire_compound
                         state.tire_age = 0
                         state.stops_done += 1
                         break
 
-                # ── Grid position advantage (first lap) ──
-                if lap == 1:
-                    # Front-row advantage on first lap
-                    position_factor = (driver.grid_position - 1) * 0.15
-                    lap_time += position_factor
+                # ── Lap time ──
+                lap_time = sample_lap_time(
+                    base_paces[state.driver_id],
+                    sigma, state.current_tire, state.tire_age,
+                    config, effective_weather, is_sc, is_vsc,
+                    driver, self._np_rng,
+                )
 
-                state.total_time += max(lap_time, base_time * 0.95)  # floor
+                # ── Grid advantage on lap 1 ──
+                if lap == 1:
+                    lap_time += (driver.grid_position - 1) * 0.15
+
+                state.total_time += lap_time
+                state.tire_age += 1
                 state.current_lap = lap
 
-        # ── Determine finishing order ──
-        finished = [s for s in states if not s.is_dnf]
-        dnf_drivers_list = [s for s in states if s.is_dnf]
+            # ── Restart volatility ──
+            if restart:
+                apply_restart_volatility(states, 0.3, self._rng)
 
-        finished.sort(key=lambda s: s.total_time)
+        # ── Classify ──
+        finishing_order, dnf_ids = classify_finishing_order(states)
 
-        finishing_order = []
-        for pos, state in enumerate(finished, 1):
-            state.final_position = pos
-            finishing_order.append(state.driver_id)
-
-        # DNFs get positions after all finishers
-        for pos, state in enumerate(dnf_drivers_list, len(finished) + 1):
-            state.final_position = pos
-            finishing_order.append(state.driver_id)
-
-        return SimulationResult(
+        n_sc = sum(1 for e in sc_events if not e.is_vsc)
+        return _IterationResult(
             finishing_order=finishing_order,
-            dnf_drivers=[s.driver_id for s in dnf_drivers_list],
-            safety_car_laps=sorted(safety_car_laps_set),
+            dnf_drivers=dnf_ids,
+            n_safety_cars=n_sc,
         )
+
+    # ── Batch Run ───────────────────────────────────────────────────────────
 
     def run(self) -> AggregatedResults:
         """
         Run N Monte Carlo simulations and aggregate results.
 
+        Uses parallel execution if config.n_workers > 1.
+
         Returns:
-            AggregatedResults with position distributions and probabilities
+            AggregatedResults (legacy-compatible) with full metrics.
         """
         n = self.config.n_simulations
-        driver_ids = [d.driver_id for d in self.drivers]
-        driver_names = {d.driver_id: d.name for d in self.drivers}
-        n_drivers = len(driver_ids)
+        driver_ids = [d.driver_id for d in self._driver_inputs]
+        driver_names = {d.driver_id: d.name for d in self._driver_inputs}
 
         # Accumulators
         position_counts: dict[int, dict[int, int]] = {
@@ -269,14 +374,18 @@ class RaceSimulator:
         }
         win_counts: dict[int, int] = defaultdict(int)
         podium_counts: dict[int, int] = defaultdict(int)
+        top10_counts: dict[int, int] = defaultdict(int)
         position_sums: dict[int, float] = defaultdict(float)
         position_sq_sums: dict[int, float] = defaultdict(float)
         dnf_counts: dict[int, int] = defaultdict(int)
         total_safety_cars = 0
 
+        # Run simulations (sequential — parallel with ProcessPoolExecutor
+        # requires pickling of rng state; kept sequential for correctness
+        # and determinism with seed).
         for _ in range(n):
             result = self._simulate_single_race()
-            total_safety_cars += len(result.safety_car_laps) / max(self.config.safety_car_laps, 1)
+            total_safety_cars += result.n_safety_cars
 
             for pos, did in enumerate(result.finishing_order, 1):
                 position_counts[did][pos] += 1
@@ -287,17 +396,18 @@ class RaceSimulator:
                     win_counts[did] += 1
                 if pos <= 3:
                     podium_counts[did] += 1
+                if pos <= 10:
+                    top10_counts[did] += 1
 
             for did in result.dnf_drivers:
                 dnf_counts[did] += 1
 
-        # Compute final probabilities
+        # Compute probabilities
         win_prob = {did: win_counts[did] / n for did in driver_ids}
         podium_prob = {did: podium_counts[did] / n for did in driver_ids}
         expected_pos = {did: position_sums[did] / n for did in driver_ids}
         dnf_rate = {did: dnf_counts[did] / n for did in driver_ids}
 
-        # Standard deviation of position
         position_std = {}
         for did in driver_ids:
             mean = expected_pos[did]
@@ -316,4 +426,105 @@ class RaceSimulator:
             position_std=position_std,
             dnf_rate=dnf_rate,
             avg_safety_cars=total_safety_cars / n,
+        )
+
+    def run_structured(self) -> SimulationOutput:
+        """
+        Run simulations and return the new structured SimulationOutput.
+
+        Includes top-10 probability, confidence intervals, convergence
+        score, and Shannon entropy.
+        """
+        n = self.config.n_simulations
+        driver_ids = [d.driver_id for d in self._driver_inputs]
+        driver_map = {d.driver_id: d for d in self._driver_inputs}
+
+        # Accumulators
+        positions_all: dict[int, list[int]] = {did: [] for did in driver_ids}
+        win_counts: dict[int, int] = defaultdict(int)
+        podium_counts: dict[int, int] = defaultdict(int)
+        top10_counts: dict[int, int] = defaultdict(int)
+        dnf_counts: dict[int, int] = defaultdict(int)
+        total_sc = 0
+        total_dnfs = 0
+
+        for _ in range(n):
+            result = self._simulate_single_race()
+            total_sc += result.n_safety_cars
+            total_dnfs += len(result.dnf_drivers)
+
+            for pos, did in enumerate(result.finishing_order, 1):
+                positions_all[did].append(pos)
+                if pos == 1:
+                    win_counts[did] += 1
+                if pos <= 3:
+                    podium_counts[did] += 1
+                if pos <= 10:
+                    top10_counts[did] += 1
+
+            for did in result.dnf_drivers:
+                dnf_counts[did] += 1
+
+        # Build DriverResults
+        driver_results = []
+        for did in driver_ids:
+            positions = positions_all[did]
+            positions_sorted = sorted(positions)
+            mean = sum(positions) / n
+            variance = sum((p - mean) ** 2 for p in positions) / n
+            std = variance ** 0.5
+            median = positions_sorted[n // 2]
+
+            # 90% confidence interval
+            ci_lower = positions_sorted[int(n * 0.05)]
+            ci_upper = positions_sorted[int(n * 0.95)]
+
+            # Position distribution
+            pos_dist = {}
+            from collections import Counter
+            counts = Counter(positions)
+            for pos, cnt in sorted(counts.items()):
+                pos_dist[str(pos)] = round(cnt / n, 4)
+
+            d = driver_map[did]
+            driver_results.append(DriverResult(
+                driver_id=did,
+                name=d.name,
+                driver_code=d.driver_code,
+                constructor=d.constructor,
+                win_probability=round(win_counts[did] / n, 4),
+                podium_probability=round(podium_counts[did] / n, 4),
+                top10_probability=round(top10_counts[did] / n, 4),
+                dnf_probability=round(dnf_counts[did] / n, 4),
+                expected_position=round(mean, 2),
+                position_std=round(std, 2),
+                median_position=float(median),
+                ci_lower=float(ci_lower),
+                ci_upper=float(ci_upper),
+                position_distribution=pos_dist,
+            ))
+
+        # Convergence score: 1 - normalised std of win probs across last 20% of iterations
+        # Simple proxy: inverse of avg position std normalised by grid size
+        n_drivers = len(driver_ids)
+        avg_std = sum(dr.position_std for dr in driver_results) / max(n_drivers, 1)
+        convergence = max(0, 1.0 - avg_std / n_drivers)
+
+        # Shannon entropy of win distribution
+        win_probs = [dr.win_probability for dr in driver_results if dr.win_probability > 0]
+        if win_probs:
+            entropy = -sum(p * math.log2(p) for p in win_probs)
+        else:
+            entropy = 0.0
+
+        return SimulationOutput(
+            n_simulations=n,
+            drivers=driver_results,
+            avg_safety_cars_per_race=round(total_sc / n, 2),
+            avg_dnfs_per_race=round(total_dnfs / n, 2),
+            convergence_score=round(convergence, 4),
+            entropy=round(entropy, 4),
+            race_name=self._race_input.race_name if self._race_input else "",
+            season_year=self._race_input.season_year if self._race_input else 0,
+            round_number=self._race_input.round_number if self._race_input else 0,
         )

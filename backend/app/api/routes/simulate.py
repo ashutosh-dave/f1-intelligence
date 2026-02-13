@@ -16,7 +16,10 @@ from data.models import (
     Qualifying, Race, RaceResult, Weather,
 )
 from simulator.config import SimulationConfig
-from simulator.engine import DriverSetup, RaceSimulator
+from simulator.schemas import (
+    DriverInput, MLPriors, RaceInput, TrackProfile, WeatherConditions,
+)
+from simulator.engine import RaceSimulator
 
 router = APIRouter()
 
@@ -26,13 +29,15 @@ async def simulate(
     season_year: int = Query(..., ge=2010, le=2030),
     round_number: int = Query(..., ge=1, le=30),
     n_simulations: int = Query(5000, ge=100, le=20000),
+    seed: int | None = Query(None),
     db: Session = Depends(get_db),
 ):
     """
     Run Monte Carlo race simulation.
 
     Returns probability distributions of finishing positions
-    for each driver in the specified race.
+    for each driver in the specified race, using the modular
+    simulation engine.
     """
     race = (
         db.query(Race)
@@ -52,58 +57,68 @@ async def simulate(
     if not results:
         raise HTTPException(status_code=404, detail="No results found for this race")
 
-    # Build driver setups
-    base_pace = 90.0
-    driver_setups = []
+    # Build track profile
+    track = TrackProfile(
+        name=circuit.name if circuit else "Unknown",
+        total_laps=race.total_laps or 55,
+        pit_loss_sec=22.0,
+    )
 
+    # Build weather conditions
+    rain_prob = weather.rain_probability if weather else 0.0
+    weather_cond = WeatherConditions(
+        rain_probability=rain_prob,
+        conditions="wet" if rain_prob > 0.5 else "dry",
+    )
+
+    # Build rich driver inputs
+    driver_inputs = []
     for res in results:
         driver = db.query(Driver).get(res.driver_id)
-        pace_offset = (res.grid - 1) * 0.12
+        constructor = db.query(Constructor).get(res.constructor_id) if res.constructor_id else None
 
         feature = (
             db.query(FeatureRow)
             .filter_by(race_id=race.id, driver_id=res.driver_id)
             .first()
         )
-        dnf_prob = feature.driver_dnf_rate if feature and feature.driver_dnf_rate else 0.05
+        dnf_rate = feature.driver_dnf_rate if feature and feature.driver_dnf_rate else 0.05
 
         name = f"{driver.first_name} {driver.last_name}" if driver else f"Driver {res.driver_id}"
 
-        driver_setups.append(DriverSetup(
+        driver_inputs.append(DriverInput(
             driver_id=res.driver_id,
             name=name,
+            driver_code=driver.code if driver else "",
+            constructor=constructor.name if constructor else "",
             grid_position=res.grid,
-            base_pace=base_pace + pace_offset,
-            dnf_probability=dnf_prob,
+            team_reliability=1.0 - dnf_rate,
         ))
 
-    # Run simulation
-    config = SimulationConfig(
-        n_simulations=n_simulations,
-        total_laps=race.total_laps or 55,
+    # Build structured input
+    race_input = RaceInput(
+        drivers=driver_inputs,
+        track=track,
+        weather=weather_cond,
+        season_year=season_year,
+        round_number=round_number,
+        race_name=race.name,
     )
-    rain_prob = weather.rain_probability if weather else 0.0
-    simulator = RaceSimulator(driver_setups, config, rain_probability=rain_prob)
+
+    # Run simulation
+    config = SimulationConfig(n_simulations=n_simulations, seed=seed)
+    simulator = RaceSimulator.from_race_input(race_input, config)
     agg = simulator.run()
     result_dict = agg.to_dict()
 
     # Build response
     drivers = []
     for d in result_dict["drivers"]:
-        did = d["driver_id"]
-        driver = db.query(Driver).get(did)
-        constructor_id = None
-        for res in results:
-            if res.driver_id == did:
-                constructor_id = res.constructor_id
-                break
-        constructor = db.query(Constructor).get(constructor_id) if constructor_id else None
-
         drivers.append(DriverPrediction(
-            driver_id=did,
+            driver_id=d["driver_id"],
             driver_name=d.get("name", "Unknown"),
-            driver_code=driver.code if driver else None,
-            constructor=constructor.name if constructor else None,
+            driver_code=d.get("driver_code") or None,
+            constructor=d.get("constructor") or None,
             win_probability=d["win_probability"],
             podium_probability=d["podium_probability"],
             dnf_probability=d["dnf_rate"],

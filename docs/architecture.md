@@ -22,7 +22,7 @@
 ### Data Layer (`data/`)
 - **models.py** — SQLAlchemy ORM (9 tables)
 - **database.py** — Engine config (Postgres/SQLite)
-- **ingest.py** — Ergast API ingestion (2010–2024)
+- **ingest.py** — Jolpica-F1 API ingestion (2010–2025, Ergast-compatible)
 - **features.py** — 15 ML features per driver per race
 
 ### ML Layer (`ml/`)
@@ -30,9 +30,12 @@
 - **predict.py** — Inference with normalized probabilities
 
 ### Simulator (`simulator/`)
-- **engine.py** — Lap-by-lap Monte Carlo (pace, pits, DNF, safety car)
-- **strategy.py** — Pit strategy generation
-- **config.py** — Tunable simulation parameters
+- **schemas.py** — Structured I/O types (RaceInput, DriverInput, SimulationOutput)
+- **engine.py** — Modular Monte Carlo orchestration (pace, pits, DNF, safety car)
+- **modules/** — pace.py, reliability.py, safety_car.py, ranking.py
+- **strategy.py** — Pit strategy generation (dry + wet + SC-reactive)
+- **config.py** — Tunable parameters with from_dict/from_yaml factories
+- **evaluation.py** — Calibration, sensitivity analysis, historical comparison
 
 ### Backend (`backend/`)
 - **main.py** — FastAPI app
@@ -46,7 +49,7 @@
 
 ## Data Flow
 
-1. **Ingest** → Ergast API → DB tables
+1. **Ingest** → Jolpica-F1 API → DB tables
 2. **Features** → Compute from DB → features table
 3. **Train** → Feature table → XGBoost → .joblib models
 4. **Predict** → API receives race config → ML inference + Simulation → Ensemble → Response
